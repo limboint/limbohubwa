@@ -12,6 +12,7 @@ let qrCodeData = null;
 let isAuthenticated = false;
 
 const LIMBO_API_URL = process.env.LIMBO_API_URL || 'https://hub.limbointernational.nl/api.php';
+const WORKSPACE_ID = process.env.WORKSPACE_ID || null;
 
 // QR-code endpoint
 app.get('/qr', async (req, res) => {
@@ -37,7 +38,6 @@ app.post('/send', async (req, res) => {
     return res.status(401).json({ error: 'Not authenticated' });
   }
   try {
-    // WhatsApp JID format: number@s.whatsapp.net
     const jid = to.includes('@') ? to : `${to.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
     await sock.sendMessage(jid, { text });
     res.json({ success: true });
@@ -49,6 +49,23 @@ app.post('/send', async (req, res) => {
 // Get messages (polling endpoint)
 app.get('/messages', (req, res) => {
   res.json({ messages: [] });
+});
+
+// Logout / disconnect
+app.post('/logout', async (req, res) => {
+  try {
+    if (sock) {
+      await sock.logout();
+      sock = null;
+    }
+    isAuthenticated = false;
+    qrCodeData = null;
+    res.json({ success: true, message: 'Logged out' });
+    // Herstart na korte pauze zodat nieuwe QR gegenereerd wordt
+    setTimeout(startBaileys, 2000);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Initialize Baileys
@@ -109,12 +126,16 @@ async function startBaileys() {
         if (!text || !from) continue;
         console.log('Incoming message from', from, ':', text.substring(0, 50));
         try {
-          await axios.post(LIMBO_API_URL, {
+          const payload = {
             action: 'whatsapp_receive_message',
             from,
             text,
             timestamp: msg.messageTimestamp,
-          });
+          };
+          if (WORKSPACE_ID) {
+            payload.workspace_id = WORKSPACE_ID;
+          }
+          await axios.post(LIMBO_API_URL, payload);
         } catch (err) {
           console.error('Failed to send to LIMBO:', err.message);
         }
@@ -129,5 +150,6 @@ async function startBaileys() {
 
 app.listen(PORT, () => {
   console.log(`Baileys server running on port ${PORT}`);
+  console.log(`Workspace ID: ${WORKSPACE_ID || 'not set (will use first workspace)'}`);
   startBaileys();
 });
