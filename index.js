@@ -1,32 +1,31 @@
-const express = require('express');
-const makeWASocket = require('@whiskeysockets/baileys').default;
-const { useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
-const axios = require('axios');
-const QRCode = require('qrcode');
+import express from 'express';
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
+import QRCode from 'qrcode';
+import axios from 'axios';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
 app.use(express.json());
 
 let sock = null;
 let qrCodeData = null;
+let isAuthenticated = false;
 
 const LIMBO_API_URL = process.env.LIMBO_API_URL || 'https://hub.limbointernational.nl/api.php';
 
 // QR-code endpoint
 app.get('/qr', async (req, res) => {
-  if (qrCodeData) {
-    res.json({ qr: qrCodeData, authenticated: sock?.user?.id ? true : false });
-  } else {
-    res.json({ qr: null, authenticated: false, message: 'Waiting for QR code...' });
-  }
+  res.json({
+    qr: qrCodeData,
+    authenticated: isAuthenticated,
+    message: qrCodeData ? 'QR ready' : (isAuthenticated ? 'Authenticated' : 'Waiting for QR code...')
+  });
 });
 
 // Auth status
 app.get('/status', (req, res) => {
   res.json({
-    authenticated: sock?.user?.id ? true : false,
+    authenticated: isAuthenticated,
     userId: sock?.user?.id || null,
   });
 });
@@ -34,71 +33,101 @@ app.get('/status', (req, res) => {
 // Send message
 app.post('/send', async (req, res) => {
   const { to, text } = req.body;
-  if (!sock || !sock.user) {
+  if (!sock || !isAuthenticated) {
     return res.status(401).json({ error: 'Not authenticated' });
   }
   try {
-    await sock.sendMessage(to, { text });
+    // WhatsApp JID format: number@s.whatsapp.net
+    const jid = to.includes('@') ? to : `${to.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
+    await sock.sendMessage(jid, { text });
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// Get messages (polling endpoint)
+app.get('/messages', (req, res) => {
+  res.json({ messages: [] });
+});
+
 // Initialize Baileys
 async function startBaileys() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+  try {
+    const { version } = await fetchLatestBaileysVersion();
+    console.log('Baileys version:', version);
 
-  sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: false,
-  });
+    const { state, saveCreds } = await useMultiFileAuthState('/tmp/auth_info_baileys');
 
-  sock.ev.on('creds.update', saveCreds);
+    sock = makeWASocket({
+      version,
+      auth: state,
+      printQRInTerminal: true,
+      browser: ['LIMBO Hub', 'Chrome', '1.0'],
+    });
 
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update;
-    if (qr) {
-      QRCode.toDataURL(qr, (err, url) => {
-        if (!err) qrCodeData = url;
-      });
-    }
-    if (connection === 'close') {
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log('Connection closed. Reconnecting:', shouldReconnect);
-      if (shouldReconnect) {
-        startBaileys();
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr) {
+        console.log('QR code received, generating image...');
+        try {
+          qrCodeData = await QRCode.toDataURL(qr);
+          console.log('QR code ready at /qr endpoint');
+        } catch (err) {
+          console.error('QR generation error:', err);
+        }
       }
-    }
-  });
 
-  sock.ev.on('messages.upsert', async (m) => {
-    for (const msg of m.messages) {
-      if (msg.key.fromMe) continue;
-
-      const from = msg.key.remoteJid;
-      const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
-
-      if (!text) continue;
-
-      // Send to LIMBO API
-      try {
-        await axios.post(LIMBO_API_URL, {
-          action: 'whatsapp_receive_message',
-          from,
-          text,
-          timestamp: msg.messageTimestamp,
-        });
-      } catch (err) {
-        console.error('Failed to send to LIMBO:', err.message);
+      if (connection === 'open') {
+        console.log('WhatsApp connected!', sock.user?.id);
+        isAuthenticated = true;
+        qrCodeData = null;
       }
-    }
-  });
+
+      if (connection === 'close') {
+        isAuthenticated = false;
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        console.log('Connection closed. Status:', statusCode, 'Reconnect:', shouldReconnect);
+        if (shouldReconnect) {
+          setTimeout(startBaileys, 3000);
+        }
+      }
+    });
+
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return;
+      for (const msg of messages) {
+        if (msg.key.fromMe) continue;
+        const from = msg.key.remoteJid;
+        const text = msg.message?.conversation ||
+                     msg.message?.extendedTextMessage?.text ||
+                     msg.message?.imageMessage?.caption || '';
+        if (!text || !from) continue;
+        console.log('Incoming message from', from, ':', text.substring(0, 50));
+        try {
+          await axios.post(LIMBO_API_URL, {
+            action: 'whatsapp_receive_message',
+            from,
+            text,
+            timestamp: msg.messageTimestamp,
+          });
+        } catch (err) {
+          console.error('Failed to send to LIMBO:', err.message);
+        }
+      }
+    });
+
+  } catch (err) {
+    console.error('Baileys init error:', err);
+    setTimeout(startBaileys, 5000);
+  }
 }
-
-startBaileys();
 
 app.listen(PORT, () => {
   console.log(`Baileys server running on port ${PORT}`);
-  console.log(`QR endpoint: http://localhost:${PORT}/qr`);
+  startBaileys();
 });
