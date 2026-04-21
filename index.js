@@ -144,9 +144,12 @@ app.post('/logout', async (req, res) => {
     await sock.logout();
     sock = null;
     isConnected = false;
+    qrCode = null;
     // Clear auth
     fs.rmSync(authDir, { recursive: true, force: true });
   }
+  // Reinitialize immediately to generate fresh QR
+  initializeWhatsApp();
   res.json({ success: true });
 });
 
