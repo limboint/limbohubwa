@@ -110,6 +110,16 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', whatsapp: isConnected ? 'connected' : 'disconnected' });
 });
 
+app.get('/status', (req, res) => {
+  if (isConnected && sock?.user?.id) {
+    res.json({ status: 'connected', phone: sock.user.id });
+  } else if (!isConnected && qrCode) {
+    res.json({ status: 'waiting', qr: qrCode });
+  } else {
+    res.json({ status: 'initializing' });
+  }
+});
+
 app.get('/qr', (req, res) => {
   if (!isConnected) {
     if (qrCode) {
