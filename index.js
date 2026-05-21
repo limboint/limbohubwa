@@ -1,155 +1,171 @@
-import express from 'express';
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
-import QRCode from 'qrcode';
-import axios from 'axios';
+const express = require('express');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const QRCode = require('qrcode');
+const fs = require('fs');
+const path = require('path');
+const axios = require('axios');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 app.use(express.json());
 
+// Auth state directory
+const authDir = '/tmp/auth_info';
+if (!fs.existsSync(authDir)) {
+  fs.mkdirSync(authDir, { recursive: true });
+}
+
+// Config
+const LIMBO_API = process.env.LIMBO_API_URL || 'https://hub.limbointernational.nl/api.php';
+const PORT = process.env.PORT || 3000;
+
 let sock = null;
-let qrCodeData = null;
-let isAuthenticated = false;
+let qrCode = null;
+let isConnected = false;
 
-const LIMBO_API_URL = process.env.LIMBO_API_URL || 'https://hub.limbointernational.nl/api.php';
-const WORKSPACE_ID = process.env.WORKSPACE_ID || null;
+// Initialize WhatsApp connection
+async function initializeWhatsApp() {
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
-// QR-code endpoint
-app.get('/qr', async (req, res) => {
-  res.json({
-    qr: qrCodeData,
-    authenticated: isAuthenticated,
-    message: qrCodeData ? 'QR ready' : (isAuthenticated ? 'Authenticated' : 'Waiting for QR code...')
+  sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: false,
   });
+
+  // QR Code event
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      try {
+        qrCode = await QRCode.toDataURL(qr);
+        console.log('QR Code generated');
+      } catch (err) {
+        console.error('QR generation error:', err);
+      }
+    }
+
+    if (connection === 'open') {
+      isConnected = true;
+      qrCode = null;
+      console.log('WhatsApp connected!');
+      
+      // Notify LIMBO that we're connected
+      try {
+        await axios.post(LIMBO_API, {
+          action: 'whatsapp_status',
+          status: 'connected',
+          phone: sock.user?.id,
+        });
+      } catch (err) {
+        console.error('Error notifying LIMBO:', err.message);
+      }
+    }
+
+    if (connection === 'close') {
+      isConnected = false;
+      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      console.log('WhatsApp disconnected, reconnecting...', shouldReconnect);
+
+      if (shouldReconnect) {
+        setTimeout(initializeWhatsApp, 3000);
+      }
+    }
+  });
+
+  // Credentials saved
+  sock.ev.on('creds.update', saveCreds);
+
+  // Messages received
+  sock.ev.on('messages.upsert', async (m) => {
+    const message = m.messages[0];
+    if (!message.message) return;
+
+    const fromMe = message.key.fromMe;
+    const chatId = message.key.remoteJid;
+    const messageId = message.key.id;
+    const timestamp = message.messageTimestamp;
+    const text = message.message.conversation || message.message.extendedTextMessage?.text || '';
+
+    console.log(`Message from ${chatId}: ${text}`);
+
+    // Send to LIMBO API
+    if (!fromMe) {
+      try {
+        await axios.post(LIMBO_API, {
+          action: 'whatsapp_receive',
+          chatId,
+          messageId,
+          text,
+          timestamp,
+        });
+      } catch (err) {
+        console.error('Error sending to LIMBO:', err.message);
+      }
+    }
+  });
+}
+
+// Routes
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', whatsapp: isConnected ? 'connected' : 'disconnected' });
 });
 
-// Auth status
 app.get('/status', (req, res) => {
-  res.json({
-    authenticated: isAuthenticated,
-    userId: sock?.user?.id || null,
-  });
+  if (isConnected && sock?.user?.id) {
+    res.json({ status: 'connected', phone: sock.user.id });
+  } else if (!isConnected && qrCode) {
+    res.json({ status: 'waiting', qr: qrCode });
+  } else {
+    res.json({ status: 'initializing' });
+  }
 });
 
-// Send message
-app.post('/send', async (req, res) => {
-  const { to, text } = req.body;
-  if (!sock || !isAuthenticated) {
-    return res.status(401).json({ error: 'Not authenticated' });
+app.get('/qr', (req, res) => {
+  if (!isConnected) {
+    if (qrCode) {
+      res.json({ qr: qrCode, status: 'waiting' });
+    } else {
+      res.json({ status: 'initializing' });
+    }
+  } else {
+    res.json({ status: 'connected' });
   }
+});
+
+app.post('/send', async (req, res) => {
+  const { phone, text } = req.body;
+
+  if (!sock || !isConnected) {
+    return res.status(503).json({ error: 'WhatsApp not connected' });
+  }
+
   try {
-    const jid = to.includes('@') ? to : `${to.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
+    const jid = phone.includes('@s.whatsapp.net') ? phone : `${phone}@s.whatsapp.net`;
     await sock.sendMessage(jid, { text });
     res.json({ success: true });
   } catch (err) {
+    console.error('Send error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Get messages (polling endpoint)
-app.get('/messages', (req, res) => {
-  res.json({ messages: [] });
-});
-
-// Logout / disconnect
 app.post('/logout', async (req, res) => {
-  try {
-    if (sock) {
-      await sock.logout();
-      sock = null;
-    }
-    isAuthenticated = false;
-    qrCodeData = null;
-    res.json({ success: true, message: 'Logged out' });
-    // Herstart na korte pauze zodat nieuwe QR gegenereerd wordt
-    setTimeout(startBaileys, 2000);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  if (sock) {
+    await sock.logout();
+    sock = null;
+    isConnected = false;
+    qrCode = null;
+    // Clear auth
+    fs.rmSync(authDir, { recursive: true, force: true });
   }
+  // Reinitialize immediately to generate fresh QR
+  initializeWhatsApp();
+  res.json({ success: true });
 });
 
-// Initialize Baileys
-async function startBaileys() {
-  try {
-    const { version } = await fetchLatestBaileysVersion();
-    console.log('Baileys version:', version);
-
-    const { state, saveCreds } = await useMultiFileAuthState('/tmp/auth_info_baileys');
-
-    sock = makeWASocket({
-      version,
-      auth: state,
-      printQRInTerminal: true,
-      browser: ['LIMBO Hub', 'Chrome', '1.0'],
-    });
-
-    sock.ev.on('creds.update', saveCreds);
-
-    sock.ev.on('connection.update', async (update) => {
-      const { connection, lastDisconnect, qr } = update;
-
-      if (qr) {
-        console.log('QR code received, generating image...');
-        try {
-          qrCodeData = await QRCode.toDataURL(qr);
-          console.log('QR code ready at /qr endpoint');
-        } catch (err) {
-          console.error('QR generation error:', err);
-        }
-      }
-
-      if (connection === 'open') {
-        console.log('WhatsApp connected!', sock.user?.id);
-        isAuthenticated = true;
-        qrCodeData = null;
-      }
-
-      if (connection === 'close') {
-        isAuthenticated = false;
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        console.log('Connection closed. Status:', statusCode, 'Reconnect:', shouldReconnect);
-        if (shouldReconnect) {
-          setTimeout(startBaileys, 3000);
-        }
-      }
-    });
-
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') return;
-      for (const msg of messages) {
-        if (msg.key.fromMe) continue;
-        const from = msg.key.remoteJid;
-        const text = msg.message?.conversation ||
-                     msg.message?.extendedTextMessage?.text ||
-                     msg.message?.imageMessage?.caption || '';
-        if (!text || !from) continue;
-        console.log('Incoming message from', from, ':', text.substring(0, 50));
-        try {
-          const payload = {
-            action: 'whatsapp_receive_message',
-            from,
-            text,
-            timestamp: msg.messageTimestamp,
-          };
-          if (WORKSPACE_ID) {
-            payload.workspace_id = WORKSPACE_ID;
-          }
-          await axios.post(LIMBO_API_URL, payload);
-        } catch (err) {
-          console.error('Failed to send to LIMBO:', err.message);
-        }
-      }
-    });
-
-  } catch (err) {
-    console.error('Baileys init error:', err);
-    setTimeout(startBaileys, 5000);
-  }
-}
+// Start
+initializeWhatsApp();
 
 app.listen(PORT, () => {
-  console.log(`Baileys server running on port ${PORT}`);
-  console.log(`Workspace ID: ${WORKSPACE_ID || 'not set (will use first workspace)'}`);
-  startBaileys();
+  console.log(`WhatsApp server running on port ${PORT}`);
 });
